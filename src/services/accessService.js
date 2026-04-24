@@ -1,5 +1,5 @@
 const pool = require('../db/pool');
-const { forbidden } = require('../utils/errors');
+const { forbidden, notFound } = require('../utils/errors');
 
 function isSuperAdmin(auth) {
   return Array.isArray(auth?.roles) && auth.roles.includes('role_super_admin');
@@ -44,6 +44,14 @@ async function getAccessibleOrgIds(auth) {
 }
 
 async function assertCanAccessOrg(auth, orgId) {
+  const exists = await pool.query(
+    'SELECT id FROM organizations WHERE id = $1 AND deleted_at IS NULL',
+    [orgId]
+  );
+  if (exists.rowCount === 0) {
+    throw notFound();
+  }
+
   if (isSuperAdmin(auth)) {
     return;
   }

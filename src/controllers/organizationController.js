@@ -25,7 +25,7 @@ function parsePagination(query) {
   const limit = Number(query.limit || 20);
   const offset = Number(query.offset || 0);
   return {
-    limit: Number.isNaN(limit) ? 20 : Math.min(limit, 100),
+    limit: Number.isNaN(limit) ? 20 : Math.max(Math.min(limit, 100), 1),
     offset: Number.isNaN(offset) ? 0 : Math.max(offset, 0)
   };
 }
@@ -35,6 +35,7 @@ async function listOrganizations(req, res, next) {
     const { limit, offset } = parsePagination(req.query);
     const filters = ['o.deleted_at IS NULL'];
     const values = [];
+    const allowedStatuses = ['active', 'archived', 'deactivated'];
 
     if (req.query.search) {
       values.push(`%${req.query.search}%`);
@@ -42,6 +43,9 @@ async function listOrganizations(req, res, next) {
     }
 
     if (req.query.status) {
+      if (!allowedStatuses.includes(req.query.status)) {
+        throw validationError({ status: ['is invalid'] });
+      }
       values.push(req.query.status);
       filters.push(`o.status = $${values.length}`);
     }
@@ -97,6 +101,9 @@ async function listOrganizations(req, res, next) {
 async function getOrganizationTree(req, res, next) {
   try {
     const depth = req.query.depth ? Number(req.query.depth) : null;
+    if (req.query.depth && (Number.isNaN(depth) || depth < 0)) {
+      throw validationError({ depth: ['must be a non-negative number'] });
+    }
     const depthValue = Number.isNaN(depth) ? null : depth;
     let rootIds = [];
 
@@ -109,7 +116,21 @@ async function getOrganizationTree(req, res, next) {
       );
       rootIds = rows.map((row) => row.id);
     } else {
-      rootIds = req.auth.orgId ? [req.auth.orgId] : [];
+      const accessible = await getAccessibleOrgIds(req.auth);
+      if (accessible.length > 0) {
+        const { rows } = await pool.query(
+          `
+            SELECT id
+            FROM organizations
+            WHERE id = ANY($1::text[])
+              AND deleted_at IS NULL
+              AND (parent_id IS NULL OR parent_id <> ALL($1::text[]))
+            ORDER BY created_at ASC
+          `,
+          [accessible]
+        );
+        rootIds = rows.map((row) => row.id);
+      }
     }
 
     const tree = await fetchTree(rootIds, depthValue);
@@ -290,17 +311,41 @@ async function updateOrganization(req, res, next) {
 }
 
 async function moveOrganization(req, res, next) {
+  const client = await pool.connect();
   try {
     const orgId = req.params.orgId;
     const newParentId = req.body?.newParentId;
     if (!newParentId) {
       throw validationError({ newParentId: ["can't be blank"] });
     }
+    if (orgId === newParentId) {
+      throw validationError({ newParentId: ['cannot be same as organization id'] });
+    }
 
     const source = await fetchOrganizationById(orgId);
     const target = await fetchOrganizationById(newParentId);
     if (!source || !target) {
       throw notFound();
+    }
+
+    const { rows: cycleRows } = await pool.query(
+      `
+        WITH RECURSIVE tree AS (
+          SELECT id
+          FROM organizations
+          WHERE id = $1 AND deleted_at IS NULL
+          UNION ALL
+          SELECT o.id
+          FROM organizations o
+          INNER JOIN tree t ON o.parent_id = t.id
+          WHERE o.deleted_at IS NULL
+        )
+        SELECT id FROM tree WHERE id = $2
+      `,
+      [orgId, newParentId]
+    );
+    if (cycleRows.length > 0) {
+      throw validationError({ newParentId: ['cannot be a descendant of the source organization'] });
     }
 
     if (!isSuperAdmin(req.auth)) {
@@ -313,7 +358,11 @@ async function moveOrganization(req, res, next) {
       }
     }
 
-    await pool.query(
+    const newDepth = target.depth + 1;
+    const depthDelta = newDepth - source.depth;
+
+    await client.query('BEGIN');
+    await client.query(
       `
         UPDATE organizations
         SET parent_id = $2,
@@ -322,15 +371,43 @@ async function moveOrganization(req, res, next) {
             updated_by = $4
         WHERE id = $1
       `,
-      [orgId, newParentId, target.depth + 1, req.auth.userId]
+      [orgId, newParentId, newDepth, req.auth.userId]
     );
+
+    if (depthDelta !== 0) {
+      await client.query(
+        `
+          WITH RECURSIVE descendants AS (
+            SELECT id
+            FROM organizations
+            WHERE parent_id = $1 AND deleted_at IS NULL
+            UNION ALL
+            SELECT o.id
+            FROM organizations o
+            INNER JOIN descendants d ON o.parent_id = d.id
+            WHERE o.deleted_at IS NULL
+          )
+          UPDATE organizations o
+          SET depth = o.depth + $2,
+              updated_at = NOW(),
+              updated_by = $3
+          WHERE o.id IN (SELECT id FROM descendants)
+        `,
+        [orgId, depthDelta, req.auth.userId]
+      );
+    }
+
+    await client.query('COMMIT');
 
     const moved = await fetchOrganizationById(orgId);
     req.auditResourceType = 'organization';
     req.auditResourceId = orgId;
     return res.status(200).json({ organization: moved });
   } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
     return next(error);
+  } finally {
+    client.release();
   }
 }
 
@@ -344,6 +421,9 @@ async function mergeOrganizations(req, res, next) {
     const sourceOrgId = req.body?.sourceOrgId;
     const targetOrgId = req.body?.targetOrgId;
     ensureFields(['sourceOrgId', 'targetOrgId'], { sourceOrgId, targetOrgId });
+    if (sourceOrgId === targetOrgId) {
+      throw validationError({ targetOrgId: ['must be different from sourceOrgId'] });
+    }
 
     const source = await fetchOrganizationById(sourceOrgId);
     const target = await fetchOrganizationById(targetOrgId);
@@ -365,7 +445,7 @@ async function mergeOrganizations(req, res, next) {
     req.auditResourceId = targetOrgId;
     return res.status(200).json({ organization: merged });
   } catch (error) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch(() => undefined);
     return next(error);
   } finally {
     client.release();
@@ -408,18 +488,6 @@ async function cloneOrganization(req, res, next) {
         req.auth.userId
       ]
     );
-
-    if (payload.includeUsers) {
-      await pool.query(
-        `
-          UPDATE users
-          SET org_id = $2,
-              updated_at = NOW()
-          WHERE org_id = $1 AND deleted_at IS NULL
-        `,
-        [sourceOrgId, newOrgId]
-      );
-    }
 
     const cloned = await fetchOrganizationById(newOrgId);
     req.auditResourceType = 'organization';
@@ -576,6 +644,9 @@ async function createRelationship(req, res, next) {
     if (!source || !target) {
       throw notFound();
     }
+    if (sourceOrgId === payload.targetOrgId) {
+      throw validationError({ targetOrgId: ['must be different from source organization'] });
+    }
 
     if (!isSuperAdmin(req.auth)) {
       if (!isOrgAdmin(req.auth)) {
@@ -625,6 +696,12 @@ async function createRelationship(req, res, next) {
     req.auditResourceId = relationshipId;
     return res.status(201).json({ relationship: rows[0] });
   } catch (error) {
+    if (error.code === '23505' && error.constraint === 'uniq_org_relationship_active') {
+      return next(validationError({ relationship: ['already exists'] }));
+    }
+    if (error.code === '23514' && error.constraint === 'organization_relationships_not_self') {
+      return next(validationError({ targetOrgId: ['must be different from source organization'] }));
+    }
     return next(error);
   }
 }

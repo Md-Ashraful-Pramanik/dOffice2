@@ -113,6 +113,36 @@ CREATE TABLE IF NOT EXISTS audits (
 CREATE INDEX IF NOT EXISTS idx_org_parent ON organizations(parent_id);
 CREATE INDEX IF NOT EXISTS idx_users_org ON users(org_id);
 CREATE INDEX IF NOT EXISTS idx_audits_user_created ON audits(user_id, created_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_org_relationship_active
+  ON organization_relationships (source_org_id, target_org_id, type)
+  WHERE deleted_at IS NULL;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'organizations_status_check'
+  ) THEN
+    ALTER TABLE organizations
+      ADD CONSTRAINT organizations_status_check
+      CHECK (status IN ('active', 'archived', 'deactivated'));
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'organization_relationships_not_self'
+  ) THEN
+    ALTER TABLE organization_relationships
+      ADD CONSTRAINT organization_relationships_not_self
+      CHECK (source_org_id <> target_org_id);
+  END IF;
+END $$;
 `;
 
 module.exports = { schemaSql };

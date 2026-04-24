@@ -32,6 +32,9 @@ async function authRequired(req, _res, next) {
     if (!session) {
       throw unauthorized();
     }
+    if (session.user_id !== decoded.sub) {
+      throw unauthorized();
+    }
     if (session.revoked_at || session.deleted_at || session.status !== 'active') {
       throw unauthorized();
     }
@@ -47,9 +50,9 @@ async function authRequired(req, _res, next) {
     };
 
     await pool.query('UPDATE sessions SET last_active_at = NOW() WHERE id = $1', [decoded.sid]);
-    next();
+    return next();
   } catch (error) {
-    next(unauthorized());
+    return next(error);
   }
 }
 

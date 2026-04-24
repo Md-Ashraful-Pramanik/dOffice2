@@ -129,7 +129,13 @@ async function register(req, res, next) {
     return res.status(201).json(toUserResponse(user, tokens));
   } catch (error) {
     if (error.code === '23505') {
-      return next(validationError({ email: ['has already been taken'], username: ['has already been taken'] }));
+      if (error.constraint === 'users_email_unique_active') {
+        return next(validationError({ email: ['has already been taken'] }));
+      }
+      if (error.constraint === 'users_username_unique_active') {
+        return next(validationError({ username: ['has already been taken'] }));
+      }
+      return next(validationError({ email: ['has already been taken'] }));
     }
     return next(error);
   }
@@ -182,10 +188,14 @@ async function login(req, res, next) {
 
 async function logout(req, res, next) {
   try {
-    await pool.query(
+    const result = await pool.query(
       'UPDATE sessions SET revoked_at = NOW() WHERE id = $1 AND user_id = $2',
       [req.auth.sessionId, req.auth.userId]
     );
+
+    if (result.rowCount === 0) {
+      throw unauthorized();
+    }
 
     req.auditResourceType = 'session';
     req.auditResourceId = req.auth.sessionId;
