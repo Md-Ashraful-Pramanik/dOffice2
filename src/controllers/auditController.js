@@ -16,7 +16,7 @@ async function getAudits(req, res, next) {
                user_agent AS "userAgent",
                metadata,
                created_at AS "createdAt"
-        FROM audits
+            FROM doffice_api_audits
         WHERE user_id = $1
         ORDER BY created_at DESC
       `,

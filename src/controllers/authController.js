@@ -1,4 +1,5 @@
 const pool = require('../db/pool');
+const { createHash } = require('crypto');
 const { prefixedId } = require('../utils/ids');
 const { hashPassword, comparePassword } = require('../utils/password');
 const { signAccessToken, signRefreshToken } = require('../utils/jwt');
@@ -59,16 +60,21 @@ async function issueSessionTokens(user, req) {
   const token = signAccessToken(accessPayload);
   const refreshToken = signRefreshToken(refreshPayload);
 
+  const accessTokenHash = createHash('sha256').update(token).digest('hex');
+  const refreshTokenHash = createHash('sha256').update(refreshToken).digest('hex');
+
   await pool.query(
     `
-      INSERT INTO sessions
-        (id, user_id, token_jti, refresh_jti, expires_at, refresh_expires_at, ip, user_agent, device_info)
+      INSERT INTO doffice_user_sessions
+        (id, user_id, access_token_hash, refresh_token_hash, token_jti, refresh_jti, is_revoked, expires_at, refresh_expires_at, ip, user_agent, device_info, updated_at)
       VALUES
-        ($1, $2, $3, $4, NOW() + INTERVAL '15 minutes', NOW() + INTERVAL '30 days', $5, $6, $7)
+        ($1, $2, $3, $4, $5, $6, FALSE, NOW() + INTERVAL '15 minutes', NOW() + INTERVAL '30 days', $7, $8, $9, NOW())
     `,
     [
       sessionId,
       user.id,
+      accessTokenHash,
+      refreshTokenHash,
       tokenJti,
       refreshJti,
       req.ip,
@@ -91,7 +97,7 @@ async function register(req, res, next) {
     const roleCheck = await pool.query(
       `
         SELECT ur.user_id
-        FROM user_roles ur
+        FROM doffice_user_roles ur
         WHERE ur.role_id = 'role_super_admin'
         LIMIT 1
       `
@@ -106,7 +112,7 @@ async function register(req, res, next) {
 
     const created = await pool.query(
       `
-        INSERT INTO users (id, username, email, password_hash)
+        INSERT INTO doffice_users (id, username, email, password_hash)
         VALUES ($1, $2, $3, $4)
         RETURNING *
       `,
@@ -114,7 +120,7 @@ async function register(req, res, next) {
     );
 
     await pool.query(
-      `INSERT INTO user_roles (user_id, role_id) VALUES ($1, 'role_super_admin')`,
+      `INSERT INTO doffice_user_roles (user_id, role_id) VALUES ($1, 'role_super_admin')`,
       [userId]
     );
 
@@ -132,7 +138,10 @@ async function register(req, res, next) {
       if (error.constraint === 'users_email_unique_active') {
         return next(validationError({ email: ['has already been taken'] }));
       }
-      if (error.constraint === 'users_username_unique_active') {
+      if (error.constraint === 'doffice_users_email_unique_active') {
+        return next(validationError({ email: ['has already been taken'] }));
+      }
+      if (error.constraint === 'users_username_unique_active' || error.constraint === 'doffice_users_username_unique_active') {
         return next(validationError({ username: ['has already been taken'] }));
       }
       return next(validationError({ email: ['has already been taken'] }));
@@ -152,8 +161,8 @@ async function login(req, res, next) {
     const { rows } = await pool.query(
       `
         SELECT u.*, COALESCE(array_agg(ur.role_id) FILTER (WHERE ur.role_id IS NOT NULL), '{}') AS role_ids
-        FROM users u
-        LEFT JOIN user_roles ur ON ur.user_id = u.id
+        FROM doffice_users u
+        LEFT JOIN doffice_user_roles ur ON ur.user_id = u.id
         WHERE LOWER(u.email) = LOWER($1)
           AND u.deleted_at IS NULL
         GROUP BY u.id
@@ -189,7 +198,7 @@ async function login(req, res, next) {
 async function logout(req, res, next) {
   try {
     const result = await pool.query(
-      'UPDATE sessions SET revoked_at = NOW() WHERE id = $1 AND user_id = $2',
+      'UPDATE doffice_user_sessions SET revoked_at = NOW(), is_revoked = TRUE, updated_at = NOW() WHERE id = $1 AND user_id = $2',
       [req.auth.sessionId, req.auth.userId]
     );
 

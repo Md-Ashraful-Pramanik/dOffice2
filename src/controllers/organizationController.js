@@ -9,6 +9,29 @@ const {
 } = require('../services/accessService');
 const { fetchOrganizationById, fetchTree, orgSelect } = require('../services/orgService');
 
+async function recalculateOrganizationDepths(client = pool) {
+  await client.query(
+    `
+      WITH RECURSIVE rebuilt AS (
+        SELECT id, parent_id, 0::int AS depth
+        FROM doffice_organizations
+        WHERE parent_id IS NULL AND deleted_at IS NULL
+        UNION ALL
+        SELECT o.id, o.parent_id, r.depth + 1
+        FROM doffice_organizations o
+        INNER JOIN rebuilt r ON o.parent_id = r.id
+        WHERE o.deleted_at IS NULL
+      )
+      UPDATE doffice_organizations o
+      SET depth = r.depth,
+          updated_at = NOW()
+      FROM rebuilt r
+      WHERE o.id = r.id
+        AND o.depth <> r.depth
+    `
+  );
+}
+
 function ensureFields(required, payload) {
   const errors = {};
   required.forEach((field) => {
@@ -70,7 +93,7 @@ async function listOrganizations(req, res, next) {
     const listResult = await pool.query(
       `
         SELECT ${orgSelect}
-        FROM organizations o
+        FROM doffice_organizations o
         WHERE ${whereSql}
         ORDER BY o.created_at DESC
         LIMIT $${values.length - 1}
@@ -81,7 +104,7 @@ async function listOrganizations(req, res, next) {
 
     const countValues = values.slice(0, -2);
     const countResult = await pool.query(
-      `SELECT COUNT(*)::int AS count FROM organizations o WHERE ${whereSql}`,
+      `SELECT COUNT(*)::int AS count FROM doffice_organizations o WHERE ${whereSql}`,
       countValues
     );
 
@@ -112,7 +135,7 @@ async function getOrganizationTree(req, res, next) {
       rootIds = [req.query.rootId];
     } else if (isSuperAdmin(req.auth)) {
       const { rows } = await pool.query(
-        'SELECT id FROM organizations WHERE parent_id IS NULL AND deleted_at IS NULL ORDER BY created_at ASC'
+        'SELECT id FROM doffice_organizations WHERE parent_id IS NULL AND deleted_at IS NULL ORDER BY created_at ASC'
       );
       rootIds = rows.map((row) => row.id);
     } else {
@@ -121,7 +144,7 @@ async function getOrganizationTree(req, res, next) {
         const { rows } = await pool.query(
           `
             SELECT id
-            FROM organizations
+            FROM doffice_organizations
             WHERE id = ANY($1::text[])
               AND deleted_at IS NULL
               AND (parent_id IS NULL OR parent_id <> ALL($1::text[]))
@@ -181,14 +204,14 @@ async function createOrganization(req, res, next) {
     const orgId = prefixedId('org');
     await pool.query(
       `
-        INSERT INTO organizations (id, name, code, type, logo, metadata, parent_id, depth, created_by, updated_by)
+        INSERT INTO doffice_organizations (id, name, code, type, logo, metadata, parent_id, depth, created_by, updated_by)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
       `,
       [
         orgId,
         payload.name,
         payload.code,
-        payload.type || 'root',
+        payload.type || (parentId ? 'division' : 'root'),
         payload.logo || null,
         JSON.stringify(payload.metadata || {}),
         parentId,
@@ -230,7 +253,7 @@ async function createSubOrganization(req, res, next) {
     const orgId = prefixedId('org');
     await pool.query(
       `
-        INSERT INTO organizations (id, name, code, type, logo, metadata, parent_id, depth, created_by, updated_by)
+        INSERT INTO doffice_organizations (id, name, code, type, logo, metadata, parent_id, depth, created_by, updated_by)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
       `,
       [
@@ -275,7 +298,7 @@ async function updateOrganization(req, res, next) {
     const payload = req.body?.organization || {};
     await pool.query(
       `
-        UPDATE organizations
+        UPDATE doffice_organizations
         SET
           name = COALESCE($2, name),
           code = COALESCE($3, code),
@@ -332,11 +355,11 @@ async function moveOrganization(req, res, next) {
       `
         WITH RECURSIVE tree AS (
           SELECT id
-          FROM organizations
+          FROM doffice_organizations
           WHERE id = $1 AND deleted_at IS NULL
           UNION ALL
           SELECT o.id
-          FROM organizations o
+          FROM doffice_organizations o
           INNER JOIN tree t ON o.parent_id = t.id
           WHERE o.deleted_at IS NULL
         )
@@ -364,7 +387,7 @@ async function moveOrganization(req, res, next) {
     await client.query('BEGIN');
     await client.query(
       `
-        UPDATE organizations
+        UPDATE doffice_organizations
         SET parent_id = $2,
             depth = $3,
             updated_at = NOW(),
@@ -379,15 +402,15 @@ async function moveOrganization(req, res, next) {
         `
           WITH RECURSIVE descendants AS (
             SELECT id
-            FROM organizations
+            FROM doffice_organizations
             WHERE parent_id = $1 AND deleted_at IS NULL
             UNION ALL
             SELECT o.id
-            FROM organizations o
+            FROM doffice_organizations o
             INNER JOIN descendants d ON o.parent_id = d.id
             WHERE o.deleted_at IS NULL
           )
-          UPDATE organizations o
+          UPDATE doffice_organizations o
           SET depth = o.depth + $2,
               updated_at = NOW(),
               updated_by = $3
@@ -432,12 +455,16 @@ async function mergeOrganizations(req, res, next) {
     }
 
     await client.query('BEGIN');
-    await client.query('UPDATE organizations SET parent_id = $2, updated_at = NOW() WHERE parent_id = $1', [sourceOrgId, targetOrgId]);
-    await client.query('UPDATE users SET org_id = $2, updated_at = NOW() WHERE org_id = $1 AND deleted_at IS NULL', [sourceOrgId, targetOrgId]);
     await client.query(
-      `UPDATE organizations SET status = 'archived', deleted_at = NOW(), updated_at = NOW(), updated_by = $2 WHERE id = $1`,
+      'UPDATE doffice_organizations SET parent_id = $2, updated_at = NOW(), updated_by = $3 WHERE parent_id = $1 AND deleted_at IS NULL',
+      [sourceOrgId, targetOrgId, req.auth.userId]
+    );
+    await client.query('UPDATE doffice_users SET org_id = $2, updated_at = NOW() WHERE org_id = $1 AND deleted_at IS NULL', [sourceOrgId, targetOrgId]);
+    await client.query(
+      `UPDATE doffice_organizations SET status = 'archived', updated_at = NOW(), updated_by = $2 WHERE id = $1 AND deleted_at IS NULL`,
       [sourceOrgId, req.auth.userId]
     );
+    await recalculateOrganizationDepths(client);
     await client.query('COMMIT');
 
     const merged = await fetchOrganizationById(targetOrgId);
@@ -473,7 +500,7 @@ async function cloneOrganization(req, res, next) {
     const newOrgId = prefixedId('org');
     await pool.query(
       `
-        INSERT INTO organizations (id, name, code, type, status, logo, parent_id, depth, metadata, created_by, updated_by)
+        INSERT INTO doffice_organizations (id, name, code, type, status, logo, parent_id, depth, metadata, created_by, updated_by)
         VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, $8, $9, $9)
       `,
       [
@@ -511,7 +538,7 @@ async function archiveOrganization(req, res, next) {
     await assertCanAccessOrg(req.auth, orgId);
 
     await pool.query(
-      `UPDATE organizations SET status = 'archived', updated_at = NOW(), updated_by = $2 WHERE id = $1 AND deleted_at IS NULL`,
+      `UPDATE doffice_organizations SET status = 'archived', updated_at = NOW(), updated_by = $2 WHERE id = $1 AND deleted_at IS NULL`,
       [orgId, req.auth.userId]
     );
 
@@ -536,7 +563,7 @@ async function restoreOrganization(req, res, next) {
     await assertCanAccessOrg(req.auth, orgId);
 
     await pool.query(
-      `UPDATE organizations SET status = 'active', updated_at = NOW(), updated_by = $2 WHERE id = $1 AND deleted_at IS NULL`,
+      `UPDATE doffice_organizations SET status = 'active', updated_at = NOW(), updated_by = $2 WHERE id = $1 AND deleted_at IS NULL`,
       [orgId, req.auth.userId]
     );
 
@@ -565,7 +592,7 @@ async function deleteOrganization(req, res, next) {
     }
 
     const childCount = await pool.query(
-      `SELECT COUNT(*)::int AS count FROM organizations WHERE parent_id = $1 AND deleted_at IS NULL AND status = 'active'`,
+      `SELECT COUNT(*)::int AS count FROM doffice_organizations WHERE parent_id = $1 AND deleted_at IS NULL AND status = 'active'`,
       [orgId]
     );
     if (childCount.rows[0].count > 0) {
@@ -573,7 +600,7 @@ async function deleteOrganization(req, res, next) {
     }
 
     const userCount = await pool.query(
-      `SELECT COUNT(*)::int AS count FROM users WHERE org_id = $1 AND deleted_at IS NULL AND status = 'active'`,
+      `SELECT COUNT(*)::int AS count FROM doffice_users WHERE org_id = $1 AND deleted_at IS NULL AND status = 'active'`,
       [orgId]
     );
     if (userCount.rows[0].count > 0) {
@@ -582,7 +609,7 @@ async function deleteOrganization(req, res, next) {
 
     await pool.query(
       `
-        UPDATE organizations
+        UPDATE doffice_organizations
         SET deleted_at = NOW(),
             status = 'deactivated',
             updated_at = NOW(),
@@ -615,7 +642,7 @@ async function listRelationships(req, res, next) {
                description,
                shared_modules AS "sharedModules",
                created_at AS "createdAt"
-        FROM organization_relationships
+        FROM doffice_organization_relationships
         WHERE deleted_at IS NULL
           AND (source_org_id = $1 OR target_org_id = $1)
         ORDER BY created_at DESC
@@ -661,7 +688,7 @@ async function createRelationship(req, res, next) {
     const relationshipId = prefixedId('rel');
     await pool.query(
       `
-        INSERT INTO organization_relationships
+        INSERT INTO doffice_organization_relationships
           (id, source_org_id, target_org_id, type, description, shared_modules, created_by)
         VALUES
           ($1, $2, $3, $4, $5, $6, $7)
@@ -686,7 +713,7 @@ async function createRelationship(req, res, next) {
                description,
                shared_modules AS "sharedModules",
                created_at AS "createdAt"
-        FROM organization_relationships
+        FROM doffice_organization_relationships
         WHERE id = $1
       `,
       [relationshipId]
@@ -696,10 +723,16 @@ async function createRelationship(req, res, next) {
     req.auditResourceId = relationshipId;
     return res.status(201).json({ relationship: rows[0] });
   } catch (error) {
-    if (error.code === '23505' && error.constraint === 'uniq_org_relationship_active') {
+    if (
+      error.code === '23505'
+      && (error.constraint === 'uniq_org_relationship_active' || error.constraint === 'doffice_uniq_org_relationship_active')
+    ) {
       return next(validationError({ relationship: ['already exists'] }));
     }
-    if (error.code === '23514' && error.constraint === 'organization_relationships_not_self') {
+    if (
+      error.code === '23514'
+      && (error.constraint === 'organization_relationships_not_self' || error.constraint === 'doffice_organization_relationships_not_self')
+    ) {
       return next(validationError({ targetOrgId: ['must be different from source organization'] }));
     }
     return next(error);
@@ -714,7 +747,7 @@ async function deleteRelationship(req, res, next) {
     const { rows } = await pool.query(
       `
         SELECT id, source_org_id, target_org_id
-        FROM organization_relationships
+        FROM doffice_organization_relationships
         WHERE id = $1 AND deleted_at IS NULL
       `,
       [relationshipId]
@@ -738,7 +771,7 @@ async function deleteRelationship(req, res, next) {
     }
 
     await pool.query(
-      'UPDATE organization_relationships SET deleted_at = NOW() WHERE id = $1',
+      'UPDATE doffice_organization_relationships SET deleted_at = NOW() WHERE id = $1',
       [relationshipId]
     );
 

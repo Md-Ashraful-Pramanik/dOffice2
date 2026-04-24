@@ -14,6 +14,9 @@ function errorHandler(error, _req, res, _next) {
     });
   }
 
+  // eslint-disable-next-line no-console
+  console.error('Unhandled error:', error);
+
   return res.status(500).json({
     error: {
       status: 500,

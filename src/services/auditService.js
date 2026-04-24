@@ -15,7 +15,7 @@ async function writeAudit({
 }) {
   await pool.query(
     `
-      INSERT INTO audits
+      INSERT INTO doffice_api_audits
         (id, user_id, action, method, path, status_code, resource_type, resource_id, ip, user_agent, metadata)
       VALUES
         ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)

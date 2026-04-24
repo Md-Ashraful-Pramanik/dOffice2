@@ -14,11 +14,11 @@ async function getDescendantOrgIds(orgId) {
     `
       WITH RECURSIVE tree AS (
         SELECT id, parent_id
-        FROM organizations
+        FROM doffice_organizations
         WHERE id = $1 AND deleted_at IS NULL
         UNION ALL
         SELECT o.id, o.parent_id
-        FROM organizations o
+        FROM doffice_organizations o
         INNER JOIN tree t ON o.parent_id = t.id
         WHERE o.deleted_at IS NULL
       )
@@ -32,7 +32,7 @@ async function getDescendantOrgIds(orgId) {
 
 async function getAccessibleOrgIds(auth) {
   if (isSuperAdmin(auth)) {
-    const { rows } = await pool.query('SELECT id FROM organizations WHERE deleted_at IS NULL');
+    const { rows } = await pool.query('SELECT id FROM doffice_organizations WHERE deleted_at IS NULL');
     return rows.map((row) => row.id);
   }
 
@@ -45,7 +45,7 @@ async function getAccessibleOrgIds(auth) {
 
 async function assertCanAccessOrg(auth, orgId) {
   const exists = await pool.query(
-    'SELECT id FROM organizations WHERE id = $1 AND deleted_at IS NULL',
+    'SELECT id FROM doffice_organizations WHERE id = $1 AND deleted_at IS NULL',
     [orgId]
   );
   if (exists.rowCount === 0) {

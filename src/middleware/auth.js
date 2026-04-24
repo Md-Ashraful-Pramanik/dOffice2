@@ -20,9 +20,10 @@ async function authRequired(req, _res, next) {
     const { rows } = await pool.query(
       `
         SELECT s.id, s.user_id, s.revoked_at, s.expires_at,
+           s.is_revoked,
                u.status, u.deleted_at
-        FROM sessions s
-        INNER JOIN users u ON u.id = s.user_id
+        FROM doffice_user_sessions s
+        INNER JOIN doffice_users u ON u.id = s.user_id
         WHERE s.id = $1
       `,
       [decoded.sid]
@@ -35,7 +36,7 @@ async function authRequired(req, _res, next) {
     if (session.user_id !== decoded.sub) {
       throw unauthorized();
     }
-    if (session.revoked_at || session.deleted_at || session.status !== 'active') {
+    if (session.revoked_at || session.is_revoked || session.deleted_at || session.status !== 'active') {
       throw unauthorized();
     }
     if (new Date(session.expires_at).getTime() < Date.now()) {
@@ -49,9 +50,12 @@ async function authRequired(req, _res, next) {
       orgId: decoded.orgId || null
     };
 
-    await pool.query('UPDATE sessions SET last_active_at = NOW() WHERE id = $1', [decoded.sid]);
+    await pool.query('UPDATE doffice_user_sessions SET last_active_at = NOW(), updated_at = NOW() WHERE id = $1', [decoded.sid]);
     return next();
   } catch (error) {
+    if (error?.name === 'JsonWebTokenError' || error?.name === 'TokenExpiredError' || error?.name === 'NotBeforeError') {
+      return next(unauthorized());
+    }
     return next(error);
   }
 }

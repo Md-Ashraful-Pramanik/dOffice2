@@ -14,19 +14,19 @@ const orgSelect = `
   o.updated_at AS "updatedAt",
   (
     SELECT COUNT(*)::int
-    FROM organizations c
+    FROM doffice_organizations c
     WHERE c.parent_id = o.id AND c.deleted_at IS NULL
   ) AS "childrenCount",
   (
     SELECT COUNT(*)::int
-    FROM users u
+    FROM doffice_users u
     WHERE u.org_id = o.id AND u.deleted_at IS NULL AND u.status = 'active'
   ) AS "userCount"
 `;
 
 async function fetchOrganizationById(orgId) {
   const { rows } = await pool.query(
-    `SELECT ${orgSelect} FROM organizations o WHERE o.id = $1 AND o.deleted_at IS NULL`,
+    `SELECT ${orgSelect} FROM doffice_organizations o WHERE o.id = $1 AND o.deleted_at IS NULL`,
     [orgId]
   );
   return rows[0] || null;
@@ -60,11 +60,11 @@ async function fetchTree(rootIds, depth) {
       `
         WITH RECURSIVE tree AS (
           SELECT id, name, code, type, status, parent_id
-          FROM organizations
+          FROM doffice_organizations
           WHERE id = ANY($1::text[]) AND deleted_at IS NULL
           UNION ALL
           SELECT o.id, o.name, o.code, o.type, o.status, o.parent_id
-          FROM organizations o
+          FROM doffice_organizations o
           INNER JOIN tree t ON o.parent_id = t.id
           WHERE o.deleted_at IS NULL
         )
@@ -78,11 +78,11 @@ async function fetchTree(rootIds, depth) {
       `
         WITH RECURSIVE tree AS (
           SELECT id, name, code, type, status, parent_id, 0 AS level
-          FROM organizations
+          FROM doffice_organizations
           WHERE id = ANY($1::text[]) AND deleted_at IS NULL
           UNION ALL
           SELECT o.id, o.name, o.code, o.type, o.status, o.parent_id, t.level + 1
-          FROM organizations o
+          FROM doffice_organizations o
           INNER JOIN tree t ON o.parent_id = t.id
           WHERE o.deleted_at IS NULL AND t.level < $2
         )
