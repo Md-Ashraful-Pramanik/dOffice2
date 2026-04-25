@@ -32,6 +32,25 @@ async function recalculateOrganizationDepths(client = pool) {
   );
 }
 
+function ensureActiveOrganization(org, fieldName) {
+  if (org.status !== 'active') {
+    throw validationError({ [fieldName]: ['must reference an active organization'] });
+  }
+}
+
+function makeCloneSuffix(id) {
+  return String(id).replace(/[^a-zA-Z0-9]/g, '').slice(-6).toLowerCase();
+}
+
+function buildClonedUsername(username, newOrgId) {
+  return `${username}.${makeCloneSuffix(newOrgId)}`;
+}
+
+function buildClonedEmail(email, newOrgId) {
+  const [localPart, domain = 'example.local'] = String(email).split('@');
+  return `${localPart}+${makeCloneSuffix(newOrgId)}@${domain}`.toLowerCase();
+}
+
 function ensureFields(required, payload) {
   const errors = {};
   required.forEach((field) => {
@@ -198,6 +217,7 @@ async function createOrganization(req, res, next) {
       if (!parent) {
         throw notFound('Parent organization not found.');
       }
+      ensureActiveOrganization(parent, 'parentId');
       depth = parent.depth + 1;
     }
 
@@ -246,6 +266,7 @@ async function createSubOrganization(req, res, next) {
     if (!parent) {
       throw notFound();
     }
+    ensureActiveOrganization(parent, 'orgId');
 
     const payload = req.body?.organization || {};
     ensureFields(['name', 'code'], payload);
@@ -350,6 +371,8 @@ async function moveOrganization(req, res, next) {
     if (!source || !target) {
       throw notFound();
     }
+    ensureActiveOrganization(source, 'orgId');
+    ensureActiveOrganization(target, 'newParentId');
 
     const { rows: cycleRows } = await pool.query(
       `
@@ -453,6 +476,8 @@ async function mergeOrganizations(req, res, next) {
     if (!source || !target) {
       throw notFound();
     }
+    ensureActiveOrganization(source, 'sourceOrgId');
+    ensureActiveOrganization(target, 'targetOrgId');
 
     await client.query('BEGIN');
     await client.query(
@@ -460,6 +485,54 @@ async function mergeOrganizations(req, res, next) {
       [sourceOrgId, targetOrgId, req.auth.userId]
     );
     await client.query('UPDATE doffice_users SET org_id = $2, updated_at = NOW() WHERE org_id = $1 AND deleted_at IS NULL', [sourceOrgId, targetOrgId]);
+    await client.query(
+      'UPDATE doffice_roles SET org_id = $2, updated_at = NOW() WHERE org_id = $1 AND deleted_at IS NULL',
+      [sourceOrgId, targetOrgId]
+    );
+
+    const sourceNavConfigResult = await client.query(
+      `
+        SELECT config
+        FROM doffice_organization_nav_configs
+        WHERE org_id = $1
+          AND deleted_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+      `,
+      [sourceOrgId]
+    );
+    const targetNavConfigResult = await client.query(
+      `
+        SELECT id
+        FROM doffice_organization_nav_configs
+        WHERE org_id = $1
+          AND deleted_at IS NULL
+        LIMIT 1
+      `,
+      [targetOrgId]
+    );
+
+    if (sourceNavConfigResult.rows[0] && targetNavConfigResult.rowCount === 0) {
+      await client.query(
+        `
+          INSERT INTO doffice_organization_nav_configs (id, org_id, config, created_at, updated_at)
+          VALUES ($1, $2, $3, NOW(), NOW())
+        `,
+        [prefixedId('nav'), targetOrgId, JSON.stringify(sourceNavConfigResult.rows[0].config || {})]
+      );
+    }
+
+    await client.query(
+      `
+        UPDATE doffice_organization_nav_configs
+        SET deleted_at = NOW(),
+            updated_at = NOW()
+        WHERE org_id = $1
+          AND deleted_at IS NULL
+      `,
+      [sourceOrgId]
+    );
+
     await client.query(
       `UPDATE doffice_organizations SET status = 'archived', updated_at = NOW(), updated_by = $2 WHERE id = $1 AND deleted_at IS NULL`,
       [sourceOrgId, req.auth.userId]
@@ -480,12 +553,14 @@ async function mergeOrganizations(req, res, next) {
 }
 
 async function cloneOrganization(req, res, next) {
+  const client = await pool.connect();
   try {
     const sourceOrgId = req.params.orgId;
     const source = await fetchOrganizationById(sourceOrgId);
     if (!source) {
       throw notFound();
     }
+    ensureActiveOrganization(source, 'orgId');
 
     if (!isSuperAdmin(req.auth)) {
       if (!isOrgAdmin(req.auth)) {
@@ -497,8 +572,15 @@ async function cloneOrganization(req, res, next) {
     const payload = req.body || {};
     ensureFields(['newName', 'newCode'], payload);
 
+    const includeRoles = payload.includeRoles === true;
+    const includeNavConfig = payload.includeNavConfig === true;
+    const includeUsers = payload.includeUsers === true;
+
     const newOrgId = prefixedId('org');
-    await pool.query(
+    const clonedRoleIds = new Map();
+
+    await client.query('BEGIN');
+    await client.query(
       `
         INSERT INTO doffice_organizations (id, name, code, type, status, logo, parent_id, depth, metadata, created_by, updated_by)
         VALUES ($1, $2, $3, $4, 'active', $5, $6, $7, $8, $9, $9)
@@ -516,16 +598,146 @@ async function cloneOrganization(req, res, next) {
       ]
     );
 
+    if (includeRoles) {
+      const { rows: roles } = await client.query(
+        `
+          SELECT id, name, description, type, inherits_from, permissions, is_system
+          FROM doffice_roles
+          WHERE org_id = $1
+            AND deleted_at IS NULL
+          ORDER BY created_at ASC
+        `,
+        [sourceOrgId]
+      );
+
+      roles.forEach((role) => {
+        clonedRoleIds.set(role.id, prefixedId('role'));
+      });
+
+      for (const role of roles) {
+        await client.query(
+          `
+            INSERT INTO doffice_roles
+              (id, name, description, type, inherits_from, permissions, org_id, is_system, created_at, updated_at)
+            VALUES
+              ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+          `,
+          [
+            clonedRoleIds.get(role.id),
+            role.name,
+            role.description,
+            role.type,
+            clonedRoleIds.get(role.inherits_from) || role.inherits_from || null,
+            JSON.stringify(role.permissions || []),
+            newOrgId,
+            role.is_system
+          ]
+        );
+      }
+    }
+
+    if (includeNavConfig) {
+      const { rows: navConfigs } = await client.query(
+        `
+          SELECT config
+          FROM doffice_organization_nav_configs
+          WHERE org_id = $1
+            AND deleted_at IS NULL
+          ORDER BY created_at DESC
+          LIMIT 1
+        `,
+        [sourceOrgId]
+      );
+
+      if (navConfigs[0]) {
+        await client.query(
+          `
+            INSERT INTO doffice_organization_nav_configs (id, org_id, config, created_at, updated_at)
+            VALUES ($1, $2, $3, NOW(), NOW())
+          `,
+          [prefixedId('nav'), newOrgId, JSON.stringify(navConfigs[0].config || {})]
+        );
+      }
+    }
+
+    if (includeUsers) {
+      const { rows: users } = await client.query(
+        `
+          SELECT *
+          FROM doffice_users
+          WHERE org_id = $1
+            AND deleted_at IS NULL
+          ORDER BY created_at ASC
+        `,
+        [sourceOrgId]
+      );
+
+      for (const user of users) {
+        const newUserId = prefixedId('user');
+        await client.query(
+          `
+            INSERT INTO doffice_users
+              (id, username, email, password_hash, name, employee_id, designation, department, bio, avatar, status, contact_info, org_id, created_at, updated_at)
+            VALUES
+              ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
+          `,
+          [
+            newUserId,
+            buildClonedUsername(user.username, newOrgId),
+            buildClonedEmail(user.email, newOrgId),
+            user.password_hash,
+            user.name,
+            user.employee_id,
+            user.designation,
+            user.department,
+            user.bio,
+            user.avatar,
+            user.status,
+            JSON.stringify(user.contact_info || {}),
+            newOrgId
+          ]
+        );
+
+        const { rows: userRoles } = await client.query(
+          `
+            SELECT ur.role_id, r.org_id
+            FROM doffice_user_roles ur
+            INNER JOIN doffice_roles r ON r.id = ur.role_id
+            WHERE ur.user_id = $1
+              AND r.deleted_at IS NULL
+          `,
+          [user.id]
+        );
+
+        for (const userRole of userRoles) {
+          const nextRoleId = clonedRoleIds.get(userRole.role_id) || (userRole.org_id ? null : userRole.role_id);
+          if (!nextRoleId || nextRoleId === 'role_super_admin') {
+            continue;
+          }
+
+          await client.query(
+            `INSERT INTO doffice_user_roles (user_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+            [newUserId, nextRoleId]
+          );
+        }
+      }
+    }
+
+    await client.query('COMMIT');
+
     const cloned = await fetchOrganizationById(newOrgId);
     req.auditResourceType = 'organization';
     req.auditResourceId = newOrgId;
 
     return res.status(201).json({ organization: cloned });
   } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
     if (error.code === '23505') {
       return next(validationError({ newCode: ['has already been taken'] }));
     }
     return next(error);
+  } finally {
+    client.release();
   }
 }
 
@@ -619,6 +831,16 @@ async function deleteOrganization(req, res, next) {
       [orgId, req.auth.userId]
     );
 
+    await pool.query(
+      `
+        UPDATE doffice_organization_relationships
+        SET deleted_at = NOW()
+        WHERE deleted_at IS NULL
+          AND (source_org_id = $1 OR target_org_id = $1)
+      `,
+      [orgId]
+    );
+
     req.auditResourceType = 'organization';
     req.auditResourceId = orgId;
 
@@ -671,6 +893,8 @@ async function createRelationship(req, res, next) {
     if (!source || !target) {
       throw notFound();
     }
+    ensureActiveOrganization(source, 'orgId');
+    ensureActiveOrganization(target, 'targetOrgId');
     if (sourceOrgId === payload.targetOrgId) {
       throw validationError({ targetOrgId: ['must be different from source organization'] });
     }

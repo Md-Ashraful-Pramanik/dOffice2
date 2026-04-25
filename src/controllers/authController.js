@@ -39,7 +39,7 @@ function getValidationErrors(requiredFields, payload) {
   return errors;
 }
 
-async function issueSessionTokens(user, req) {
+async function issueSessionTokens(user, req, dbClient = pool) {
   const sessionId = prefixedId('sess');
   const tokenJti = prefixedId('tok');
   const refreshJti = prefixedId('rtok');
@@ -63,7 +63,7 @@ async function issueSessionTokens(user, req) {
   const accessTokenHash = createHash('sha256').update(token).digest('hex');
   const refreshTokenHash = createHash('sha256').update(refreshToken).digest('hex');
 
-  await pool.query(
+  await dbClient.query(
     `
       INSERT INTO doffice_user_sessions
         (id, user_id, access_token_hash, refresh_token_hash, token_jti, refresh_jti, is_revoked, expires_at, refresh_expires_at, ip, user_agent, device_info, updated_at)
@@ -87,6 +87,7 @@ async function issueSessionTokens(user, req) {
 }
 
 async function register(req, res, next) {
+  const client = await pool.connect();
   try {
     const payload = req.body?.user || {};
     const errors = getValidationErrors(['username', 'email', 'password'], payload);
@@ -94,7 +95,10 @@ async function register(req, res, next) {
       throw validationError(errors);
     }
 
-    const roleCheck = await pool.query(
+    const normalizedUsername = String(payload.username).trim();
+    const normalizedEmail = String(payload.email).trim().toLowerCase();
+
+    const roleCheck = await client.query(
       `
         SELECT ur.user_id
         FROM doffice_user_roles ur
@@ -110,23 +114,27 @@ async function register(req, res, next) {
     const userId = prefixedId('user');
     const passwordHash = await hashPassword(payload.password);
 
-    const created = await pool.query(
+    await client.query('BEGIN');
+
+    const created = await client.query(
       `
         INSERT INTO doffice_users (id, username, email, password_hash)
         VALUES ($1, $2, $3, $4)
         RETURNING *
       `,
-      [userId, payload.username, payload.email.toLowerCase(), passwordHash]
+      [userId, normalizedUsername, normalizedEmail, passwordHash]
     );
 
-    await pool.query(
+    await client.query(
       `INSERT INTO doffice_user_roles (user_id, role_id) VALUES ($1, 'role_super_admin')`,
       [userId]
     );
 
     const user = created.rows[0];
     user.role_ids = ['role_super_admin'];
-    const tokens = await issueSessionTokens(user, req);
+    const tokens = await issueSessionTokens(user, req, client);
+
+    await client.query('COMMIT');
 
     req.auditUserId = user.id;
     req.auditResourceType = 'user';
@@ -134,6 +142,7 @@ async function register(req, res, next) {
 
     return res.status(201).json(toUserResponse(user, tokens));
   } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
     if (error.code === '23505') {
       if (error.constraint === 'users_email_unique_active') {
         return next(validationError({ email: ['has already been taken'] }));
@@ -147,6 +156,8 @@ async function register(req, res, next) {
       return next(validationError({ email: ['has already been taken'] }));
     }
     return next(error);
+  } finally {
+    client.release();
   }
 }
 
@@ -158,6 +169,8 @@ async function login(req, res, next) {
       throw validationError(errors);
     }
 
+    const normalizedEmail = String(payload.email).trim().toLowerCase();
+
     const { rows } = await pool.query(
       `
         SELECT u.*, COALESCE(array_agg(ur.role_id) FILTER (WHERE ur.role_id IS NOT NULL), '{}') AS role_ids
@@ -167,7 +180,7 @@ async function login(req, res, next) {
           AND u.deleted_at IS NULL
         GROUP BY u.id
       `,
-      [payload.email]
+      [normalizedEmail]
     );
 
     const user = rows[0];
@@ -188,6 +201,7 @@ async function login(req, res, next) {
 
     req.auditUserId = user.id;
     req.auditResourceType = 'session';
+    req.auditResourceId = user.id;
 
     return res.status(200).json(toUserResponse(user, tokens));
   } catch (error) {

@@ -2,16 +2,25 @@ const { Pool } = require('pg');
 const env = require('../config/env');
 
 let currentPool;
-let connectionMode = 'postgres';
 
 function createPostgresPool() {
-  return new Pool({
+  const pool = new Pool({
     host: env.db.host,
     port: env.db.port,
     user: env.db.user,
     password: env.db.password,
-    database: env.db.database
+    database: env.db.database,
+    max: 10,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000
   });
+
+  pool.on('error', (error) => {
+    // eslint-disable-next-line no-console
+    console.error('Unexpected PostgreSQL pool error:', error.message);
+  });
+
+  return pool;
 }
 
 function getPool() {
@@ -22,28 +31,13 @@ function getPool() {
   return currentPool;
 }
 
-async function replacePool(nextPool, nextMode) {
+async function replacePool(nextPool) {
   if (currentPool && currentPool !== nextPool) {
     await currentPool.end().catch(() => undefined);
   }
 
   currentPool = nextPool;
-  connectionMode = nextMode;
   return currentPool;
-}
-
-async function useInMemoryDb() {
-  const { newDb } = require('pg-mem');
-  const db = newDb({ autoCreateForeignKeyIndices: true });
-  const pgMem = db.adapters.createPg();
-  const inMemoryPool = new pgMem.Pool();
-
-  await replacePool(inMemoryPool, 'in-memory');
-  return currentPool;
-}
-
-function isUsingInMemoryDb() {
-  return connectionMode === 'in-memory';
 }
 
 const pool = {
@@ -56,10 +50,12 @@ const pool = {
   end(...args) {
     return getPool().end(...args);
   },
-  useInMemoryDb,
-  isUsingInMemoryDb,
   getConnectionMode() {
-    return connectionMode;
+    return 'postgres';
+  },
+  async reset() {
+    const nextPool = createPostgresPool();
+    await replacePool(nextPool);
   }
 };
 

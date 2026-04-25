@@ -77,6 +77,8 @@ CREATE TABLE IF NOT EXISTS doffice_roles (
   name TEXT NOT NULL,
   description TEXT,
   type TEXT NOT NULL DEFAULT 'system',
+  inherits_from TEXT,
+  permissions JSONB NOT NULL DEFAULT '[]'::jsonb,
   org_id TEXT REFERENCES doffice_organizations(id),
   is_system BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -86,6 +88,8 @@ CREATE TABLE IF NOT EXISTS doffice_roles (
 
 ALTER TABLE doffice_roles ADD COLUMN IF NOT EXISTS description TEXT;
 ALTER TABLE doffice_roles ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'system';
+ALTER TABLE doffice_roles ADD COLUMN IF NOT EXISTS inherits_from TEXT;
+ALTER TABLE doffice_roles ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE doffice_roles ADD COLUMN IF NOT EXISTS org_id TEXT REFERENCES doffice_organizations(id);
 ALTER TABLE doffice_roles ADD COLUMN IF NOT EXISTS is_system BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE doffice_roles ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
@@ -153,6 +157,24 @@ ALTER TABLE doffice_organization_relationships ADD COLUMN IF NOT EXISTS created_
 ALTER TABLE doffice_organization_relationships ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE doffice_organization_relationships ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
+CREATE TABLE IF NOT EXISTS doffice_organization_nav_configs (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES doffice_organizations(id),
+  config JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at TIMESTAMPTZ
+);
+
+ALTER TABLE doffice_organization_nav_configs ADD COLUMN IF NOT EXISTS config JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE doffice_organization_nav_configs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE doffice_organization_nav_configs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE doffice_organization_nav_configs ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+CREATE UNIQUE INDEX IF NOT EXISTS doffice_org_nav_config_org_unique_active
+  ON doffice_organization_nav_configs (org_id)
+  WHERE deleted_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS doffice_api_audits (
   id TEXT PRIMARY KEY,
   user_id TEXT REFERENCES doffice_users(id),
@@ -211,6 +233,19 @@ BEGIN
     ALTER TABLE doffice_organization_relationships
       ADD CONSTRAINT doffice_organization_relationships_not_self
       CHECK (source_org_id <> target_org_id);
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'doffice_organizations_parent_not_self'
+  ) THEN
+    ALTER TABLE doffice_organizations
+      ADD CONSTRAINT doffice_organizations_parent_not_self
+      CHECK (parent_id IS NULL OR parent_id <> id);
   END IF;
 END $$;
 `;

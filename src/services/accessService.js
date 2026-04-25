@@ -36,8 +36,12 @@ async function getAccessibleOrgIds(auth) {
     return rows.map((row) => row.id);
   }
 
-  if (!auth?.orgId || !isOrgAdmin(auth)) {
+  if (!auth?.orgId) {
     return [];
+  }
+
+  if (!isOrgAdmin(auth)) {
+    return [auth.orgId];
   }
 
   return getDescendantOrgIds(auth.orgId);

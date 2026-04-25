@@ -1,4 +1,5 @@
 const pool = require('../db/pool');
+const { createHash } = require('crypto');
 const { verifyToken } = require('../utils/jwt');
 const { unauthorized } = require('../utils/errors');
 
@@ -17,29 +18,27 @@ async function authRequired(req, _res, next) {
     }
 
     const decoded = verifyToken(token);
+    const tokenHash = createHash('sha256').update(token).digest('hex');
     const { rows } = await pool.query(
       `
-        SELECT s.id, s.user_id, s.revoked_at, s.expires_at,
-           s.is_revoked,
-               u.status, u.deleted_at
+        SELECT s.id, s.user_id
         FROM doffice_user_sessions s
         INNER JOIN doffice_users u ON u.id = s.user_id
         WHERE s.id = $1
+          AND s.user_id = $2
+          AND s.token_jti = $3
+          AND s.access_token_hash = $4
+          AND s.revoked_at IS NULL
+          AND s.is_revoked = FALSE
+          AND s.expires_at > NOW()
+          AND u.deleted_at IS NULL
+          AND u.status = 'active'
       `,
-      [decoded.sid]
+      [decoded.sid, decoded.sub, decoded.jti, tokenHash]
     );
 
     const session = rows[0];
     if (!session) {
-      throw unauthorized();
-    }
-    if (session.user_id !== decoded.sub) {
-      throw unauthorized();
-    }
-    if (session.revoked_at || session.is_revoked || session.deleted_at || session.status !== 'active') {
-      throw unauthorized();
-    }
-    if (new Date(session.expires_at).getTime() < Date.now()) {
       throw unauthorized();
     }
 

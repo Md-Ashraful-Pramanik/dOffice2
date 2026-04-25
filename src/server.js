@@ -5,19 +5,15 @@ const pool = require('./db/pool');
 
 async function start() {
   try {
-    try {
-      await initDb();
-    } catch (error) {
-      // eslint-disable-next-line no-console
-      console.warn(`Primary database unavailable, starting with in-memory storage: ${error.message}`);
-      await pool.useInMemoryDb();
-      await initDb();
-    }
+    await pool.reset();
+    await initDb();
 
-    app.listen(env.port, () => {
+    const server = app.listen(env.port, () => {
       // eslint-disable-next-line no-console
       console.log(`Server running on port ${env.port} (${pool.getConnectionMode()})`);
     });
+
+    return server;
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error('Failed to start server:', error.message);
@@ -25,4 +21,8 @@ async function start() {
   }
 }
 
-start();
+if (require.main === module) {
+  start();
+}
+
+module.exports = { start };
