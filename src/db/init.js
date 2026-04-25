@@ -1,8 +1,16 @@
 const pool = require('./pool');
 const { schemaSql } = require('./schema');
 
+function getBootstrapSchemaSql() {
+  if (!pool.isUsingInMemoryDb()) {
+    return schemaSql;
+  }
+
+  return schemaSql.replace(/DO \$\$[\s\S]*?END \$\$;/g, '').trim();
+}
+
 async function initDb() {
-  await pool.query(schemaSql);
+  await pool.query(getBootstrapSchemaSql());
 
   await pool.query(
     `
